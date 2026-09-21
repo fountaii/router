@@ -1,0 +1,43 @@
+# dependencies (bun install)
+node_modules
+
+# output
+out
+dist
+*.tgz
+
+# code coverage
+coverage
+*.lcov
+
+# logs
+logs
+_.log
+report.[0-9]_.[0-9]_.[0-9]_.[0-9]_.json
+
+# dotenv environment variable files
+.env
+.env.development.local
+.env.test.local
+.env.production.local
+.env.local
+
+# caches
+.eslintcache
+.cache
+*.tsbuildinfo
+
+# IntelliJ based IDEs
+.idea
+
+# Finder (MacOS) folder config
+.DS_Store
+
+# runtimes CUDA/cuDNN copiados ao lado do binding (~900 MB, ver README)
+src/onnx/bin/*/*/cublas*.dll
+src/onnx/bin/*/*/cudnn*.dll
+src/onnx/bin/*/*/onnxruntime_providers_cuda.dll
+
+# sobras do estudo TensorRT (ver study/latency_findings.md)
+TensorrtExecutionProvider_*.onnx
+onnxruntime_profile__*.json

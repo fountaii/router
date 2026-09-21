@@ -1,0 +1,20 @@
+{
+  "name": "router",
+  "module": "index.ts",
+  "type": "module",
+  "private": true,
+  "devDependencies": {
+    "@types/bun": "latest",
+    "node-addon-api": "^8.9.2"
+  },
+  "peerDependencies": {
+    "typescript": "^7"
+  },
+  "dependencies": {
+    "tokenizers": "^0.23.2"
+  },
+  "scripts": {
+    "build:native": "node scripts/build-native.mjs",
+    "build:model": "node scripts/build-model.mjs"
+  }
+}

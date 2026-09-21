@@ -1,0 +1,292 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>router — optimizing a 350M prompt router down to 2.2ms</title>
+<meta name="description" content="Hand-optimizing LiquidAI's LFM2.5-Encoder-350M-Prompt-Router: layer pruning, FFN pruning, and local distillation of RoPE-free attention. 2.70ms to 2.20ms, no retraining of the base model.">
+<style>
+  :root{
+    --bg:#0b0d12; --bg2:#11141b; --panel:#151922; --border:#232838;
+    --text:#e8eaf0; --muted:#8b93a7; --accent:#7dd3fc; --accent2:#a78bfa;
+    --good:#4ade80; --bad:#f87171; --mono:'SFMono-Regular',Consolas,'Liberation Mono',Menlo,monospace;
+  }
+  @media (prefers-color-scheme: light){
+    :root{
+      --bg:#f7f8fb; --bg2:#ffffff; --panel:#ffffff; --border:#e3e6ef;
+      --text:#12151c; --muted:#5b6272; --accent:#0284c7; --accent2:#7c3aed;
+      --good:#16a34a; --bad:#dc2626;
+    }
+  }
+  *{box-sizing:border-box}
+  html{scroll-behavior:smooth}
+  body{
+    margin:0; background:var(--bg); color:var(--text);
+    font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Inter,Roboto,sans-serif;
+    line-height:1.6; -webkit-font-smoothing:antialiased;
+  }
+  .wrap{max-width:920px; margin:0 auto; padding:0 20px}
+  a{color:var(--accent)}
+  code, .mono{font-family:var(--mono)}
+
+  header.hero{
+    padding:72px 0 56px; border-bottom:1px solid var(--border);
+    background:
+      radial-gradient(600px 300px at 15% -10%, color-mix(in srgb, var(--accent) 14%, transparent), transparent),
+      radial-gradient(500px 260px at 90% -20%, color-mix(in srgb, var(--accent2) 12%, transparent), transparent);
+  }
+  .eyebrow{
+    font-family:var(--mono); font-size:13px; color:var(--muted);
+    letter-spacing:.04em; text-transform:uppercase; margin:0 0 14px;
+  }
+  h1{font-size:clamp(28px,4.4vw,44px); line-height:1.15; margin:0 0 18px; letter-spacing:-0.02em}
+  h1 .accent{color:var(--accent)}
+  .lede{font-size:18px; color:var(--muted); max-width:640px; margin:0 0 28px}
+  .cta-row{display:flex; gap:10px; flex-wrap:wrap}
+  .btn{
+    display:inline-flex; align-items:center; gap:8px; padding:10px 16px; border-radius:8px;
+    text-decoration:none; font-size:14px; font-weight:600; border:1px solid var(--border);
+  }
+  .btn.primary{background:var(--text); color:var(--bg); border-color:var(--text)}
+  .btn.ghost{color:var(--text)}
+  .btn:hover{opacity:.85}
+
+  .stats{
+    display:grid; grid-template-columns:repeat(auto-fit,minmax(150px,1fr)); gap:1px;
+    background:var(--border); border:1px solid var(--border); border-radius:12px;
+    overflow:hidden; margin-top:40px;
+  }
+  .stat{background:var(--panel); padding:20px 18px}
+  .stat .k{font-family:var(--mono); font-size:26px; font-weight:700; letter-spacing:-.02em}
+  .stat .k small{font-size:14px; color:var(--muted); font-weight:500}
+  .stat .l{font-size:13px; color:var(--muted); margin-top:4px}
+  .stat .delta{font-family:var(--mono); font-size:12px; color:var(--good); margin-top:6px}
+
+  main{padding:56px 0}
+  section{margin-bottom:64px}
+  section h2{font-size:24px; letter-spacing:-.01em; margin:0 0 8px}
+  section .sub{color:var(--muted); margin:0 0 28px; max-width:640px}
+
+  .bars{display:flex; flex-direction:column; gap:16px; margin:28px 0}
+  .bar-row{display:grid; grid-template-columns:110px 1fr 90px; align-items:center; gap:14px}
+  .bar-row .label{font-size:13px; color:var(--muted)}
+  .bar-track{height:26px; background:var(--panel); border:1px solid var(--border); border-radius:6px; overflow:hidden}
+  .bar-fill{height:100%; border-radius:6px 0 0 6px}
+  .bar-fill.before{background:linear-gradient(90deg,var(--bad),color-mix(in srgb, var(--bad) 60%, var(--accent2)))}
+  .bar-fill.after{background:linear-gradient(90deg,var(--accent),var(--good))}
+  .bar-row .val{font-family:var(--mono); font-size:13px; text-align:right}
+
+  .timeline{border-left:2px solid var(--border); margin-left:6px; padding-left:28px; display:flex; flex-direction:column; gap:34px}
+  .step{position:relative}
+  .step::before{
+    content:''; position:absolute; left:-34px; top:4px; width:11px; height:11px; border-radius:50%;
+    background:var(--accent); border:3px solid var(--bg);
+  }
+  .step h3{margin:0 0 6px; font-size:17px; display:flex; align-items:center; gap:10px; flex-wrap:wrap}
+  .badge{
+    font-family:var(--mono); font-size:11px; padding:2px 8px; border-radius:999px;
+    background:color-mix(in srgb, var(--good) 18%, transparent); color:var(--good); font-weight:600;
+  }
+  .step p{margin:0; color:var(--muted); font-size:14.5px; max-width:620px}
+  .step .result{
+    margin-top:10px; font-family:var(--mono); font-size:13px;
+    background:var(--panel); border:1px solid var(--border); border-radius:8px; padding:10px 14px; display:inline-block;
+  }
+
+  .grid-2{display:grid; grid-template-columns:1fr; gap:14px}
+  @media (min-width:640px){ .grid-2{grid-template-columns:1fr 1fr} }
+  .card{
+    background:var(--panel); border:1px solid var(--border); border-radius:10px; padding:18px 20px;
+  }
+  .card h4{margin:0 0 8px; font-size:15px; display:flex; align-items:center; gap:8px}
+  .card h4 .x{color:var(--bad); font-family:var(--mono)}
+  .card p{margin:0; font-size:13.5px; color:var(--muted)}
+  .card .num{font-family:var(--mono); color:var(--text); font-weight:600}
+
+  .next{
+    border:1px dashed var(--accent2); border-radius:12px; padding:24px 26px;
+    background:color-mix(in srgb, var(--accent2) 6%, transparent);
+  }
+  .next h2{color:var(--accent2)}
+
+  footer{border-top:1px solid var(--border); padding:36px 0 56px; color:var(--muted); font-size:13.5px}
+  footer a{color:var(--text); text-decoration:none; border-bottom:1px solid var(--border)}
+  footer .cols{display:flex; gap:40px; flex-wrap:wrap; margin-bottom:24px}
+
+  .lang-toggle{font-family:var(--mono); font-size:12px; color:var(--muted)}
+  .lang-toggle button{
+    background:none; border:1px solid var(--border); color:var(--muted); border-radius:6px;
+    padding:4px 10px; font-family:var(--mono); font-size:12px; cursor:pointer;
+  }
+  .lang-toggle button.active{color:var(--text); border-color:var(--accent)}
+  [data-lang]{display:none}
+  [data-lang].active{display:block}
+</style>
+</head>
+<body>
+
+<header class="hero">
+  <div class="wrap">
+    <p class="eyebrow">optimization case study · LFM2.5-Encoder-350M</p>
+    <h1>A 350M prompt router, tuned down to <span class="accent">2.2ms</span> — without retraining the base model.</h1>
+    <p class="lede" data-lang="en">Every technique tried against a real production workload: what shipped, what was measured and thrown away, and the numbers behind each call.</p>
+    <p class="lede" data-lang="pt">Cada técnica testada contra uma carga de trabalho real de produção: o que foi pra produção, o que foi medido e descartado, e os números por trás de cada decisão.</p>
+    <div class="cta-row">
+      <a class="btn primary" href="https://github.com/eletroswing/router">View on GitHub</a>
+      <a class="btn ghost" href="https://github.com/eletroswing/router/blob/main/study/latency_findings.md">Read the full findings log</a>
+      <span class="lang-toggle" style="align-self:center; margin-left:auto">
+        <button onclick="setLang('en')" id="btn-en" class="active">EN</button>
+        <button onclick="setLang('pt')" id="btn-pt">PT</button>
+      </span>
+    </div>
+
+    <div class="stats">
+      <div class="stat"><div class="k">2.70<small>ms</small></div><div class="l">route() before</div></div>
+      <div class="stat"><div class="k">2.20<small>ms</small></div><div class="l">route() after</div><div class="delta">↓ 19%</div></div>
+      <div class="stat"><div class="k">613<small>MB</small></div><div class="l">model before</div></div>
+      <div class="stat"><div class="k">505<small>MB</small></div><div class="l">model after</div><div class="delta">↓ 18%</div></div>
+    </div>
+  </div>
+</header>
+
+<main class="wrap">
+
+  <section>
+    <div data-lang="en" class="active">
+      <h2>Where the time went</h2>
+      <p class="sub"><code>session.run</code> p50, RTX 4090 Laptop, CUDA graph, fp16, 32-token bucket.</p>
+    </div>
+    <div data-lang="pt">
+      <h2>Pra onde foi o tempo</h2>
+      <p class="sub"><code>session.run</code> p50, RTX 4090 Laptop, CUDA graph, fp16, bucket de 32 tokens.</p>
+    </div>
+    <div class="bars">
+      <div class="bar-row">
+        <span class="label">before</span>
+        <div class="bar-track"><div class="bar-fill before" style="width:100%"></div></div>
+        <span class="val">2.35 ms</span>
+      </div>
+      <div class="bar-row">
+        <span class="label">after</span>
+        <div class="bar-track"><div class="bar-fill after" style="width:77%"></div></div>
+        <span class="val">1.82 ms</span>
+      </div>
+    </div>
+  </section>
+
+  <section>
+    <div data-lang="en" class="active">
+      <h2>The journey</h2>
+      <p class="sub">Three changes shipped. Each one validated on 26 routing cases (16 easy + 10 deliberately hard, near-synonym categories) before being trusted.</p>
+    </div>
+    <div data-lang="pt">
+      <h2>A jornada</h2>
+      <p class="sub">Três mudanças foram pra produção. Cada uma validada em 26 casos de roteamento (16 fáceis + 10 propositalmente difíceis, categorias quase-sinônimas) antes de confiar.</p>
+    </div>
+
+    <div class="timeline">
+      <div class="step">
+        <h3>Layer pruning <span class="badge">shipped</span></h3>
+        <div data-lang="en" class="active"><p>Removed 2 of 6 attention layers — the 2 deepest, most redundant. The other 4 broke routing hard when removed (top-1 dropped to 13/16 on some). Zero-shot ONNX graph surgery, no training.</p></div>
+        <div data-lang="pt"><p>Removidas 2 das 6 camadas de atenção — as 2 mais profundas e redundantes. As outras 4 quebravam o roteamento feio quando removidas (top-1 caía pra 13/16 em algumas). Cirurgia de grafo ONNX sem treino nenhum.</p></div>
+        <div class="result">16 → 14 layers · 26/26 · cosine ≥ 0.999</div>
+      </div>
+
+      <div class="step">
+        <h3>FFN pruning <span class="badge">shipped</span></h3>
+        <div data-lang="en" class="active"><p>SwiGLU intermediate width cut by magnitude scoring — each channel scored by the combined norm of its gate/up/down weights, not naive first-N truncation.</p></div>
+        <div data-lang="pt"><p>Largura intermediária do SwiGLU cortada por pontuação de magnitude — cada canal pontuado pela norma combinada dos pesos de gate/up/down, não truncamento cru dos primeiros N.</p></div>
+        <div class="result">4608 → 4096 · +6% latency</div>
+      </div>
+
+      <div class="step">
+        <h3>Attention distilled without RoPE <span class="badge">shipped</span></h3>
+        <div data-lang="en" class="active"><p>The 3 remaining critical attention layers keep their exact original Q/K/V/O weights and QK-Norm — only rotary position embeddings are dropped. End-to-end distillation (loss on the router's final output, gradient through the whole network, <code>accelerate</code> + bf16) closed the gap in <strong>1 epoch</strong>. More training just memorized the synthetic dataset.</p></div>
+        <div data-lang="pt"><p>As 3 camadas de atenção críticas restantes mantêm os pesos Q/K/V/O e o QK-Norm originais exatos — só o rotary position embedding é removido. Destilação fim-a-fim (loss na saída final do router, gradiente pela rede inteira, <code>accelerate</code> + bf16) fechou a diferença em <strong>1 época</strong>. Mais treino só decorava o dataset sintético.</p></div>
+        <div class="result">3 layers, RoPE removed · +4% latency · 25-26/26</div>
+      </div>
+    </div>
+  </section>
+
+  <section>
+    <div data-lang="en" class="active">
+      <h2>What didn't work</h2>
+      <p class="sub">Tested, measured, and documented so nobody repeats the work.</p>
+    </div>
+    <div data-lang="pt">
+      <h2>O que não funcionou</h2>
+      <p class="sub">Testado, medido e documentado pra ninguém repetir o trabalho.</p>
+    </div>
+
+    <div class="grid-2">
+      <div class="card">
+        <h4><span class="x">✕</span> TensorRT</h4>
+        <div data-lang="en" class="active"><p>Even the only numerically-correct variant (fp32 + CUDA graph) was slower than plain CUDA EP: <span class="num">4.37ms vs ~2.2ms</span>, plus a 1.42GB engine. fp16 inside TensorRT collapsed precision (cosine 0.141).</p></div>
+        <div data-lang="pt"><p>Até a única variante numericamente correta (fp32 + CUDA graph) ficou mais lenta que o CUDA EP comum: <span class="num">4.37ms vs ~2.2ms</span>, além de uma engine de 1.42GB. fp16 dentro do TensorRT quebrou a precisão (cosseno 0.141).</p></div>
+      </div>
+      <div class="card">
+        <h4><span class="x">✕</span> INT8 / INT4 / FP8 weight-only</h4>
+        <div data-lang="en" class="active"><p>All three tested on the real bottleneck (FFN weights). INT8 was <em>slower</em> than fp16 — dequant overhead beats bandwidth saved at this batch size. INT4 broke precision. FP8 was slower too.</p></div>
+        <div data-lang="pt"><p>Os três testados no gargalo real (peso do FFN). INT8 ficou <em>mais lento</em> que fp16 — overhead de desempacotar supera a banda economizada nesse tamanho de lote. INT4 quebrou precisão. FP8 também ficou mais lento.</p></div>
+      </div>
+      <div class="card">
+        <h4><span class="x">✕</span> 2:4 structured sparsity</h4>
+        <div data-lang="en" class="active"><p>Broke precision outright: <span class="num">cosine 0.28</span> against reference. Unstructured pruning without retraining, as expected.</p></div>
+        <div data-lang="pt"><p>Quebrou a precisão na hora: <span class="num">cosseno 0.28</span> contra a referência. Poda sem retreino, como esperado.</p></div>
+      </div>
+      <div class="card">
+        <h4><span class="x">✕</span> Attention → conv, all the way</h4>
+        <div data-lang="en" class="active"><p>Replacing <em>every</em> attention layer with gated conv plateaued at a hard ceiling — cosine stuck at <span class="num">~0.13</span> across 40 epochs of training. Convolution only mixes local neighbors; some cases need long-range mixing only attention provides.</p></div>
+        <div data-lang="pt"><p>Substituir <em>toda</em> camada de atenção por conv bateu num teto — cosseno travado em <span class="num">~0.13</span> ao longo de 40 épocas de treino. Convolução só mistura vizinhos locais; alguns casos precisam de mistura de longo alcance que só atenção entrega.</p></div>
+      </div>
+    </div>
+  </section>
+
+  <section class="next">
+    <div data-lang="en" class="active">
+      <h2>Next: ternary quantization</h2>
+      <p class="sub">The remaining floor is bandwidth to VRAM — reading ~500MB of fp16 weight every forward pass. Every quantization tried above shrank storage but still dequantized back to a dense GEMM, which is why they didn't pay off. <strong>Ternary weights (~1.58 bit, BitNet-style)</strong> are different: they replace the GEMM itself (accumulate ±1/0, no multiply) instead of shrinking-then-dequantizing. That's a real kernel-level change, not a drop-in ONNX Runtime op — the next thing on the list, not something finished here.</p>
+    </div>
+    <div data-lang="pt">
+      <h2>Próximo passo: quantização ternária</h2>
+      <p class="sub">O piso que sobra é banda até a VRAM — ler ~500MB de peso fp16 a cada forward. Toda quantização testada acima encolhia o armazenamento mas ainda desempacotava de volta pra um GEMM denso, por isso não compensou. <strong>Pesos ternários (~1.58 bit, estilo BitNet)</strong> são diferentes: substituem o próprio GEMM (acumula ±1/0, sem multiplicação) em vez de encolher-e-desempacotar. É mudança de nível de kernel de verdade, não um op plug-and-play do ONNX Runtime — o próximo item da lista, não algo terminado aqui.</p>
+    </div>
+  </section>
+
+</main>
+
+<footer>
+  <div class="wrap">
+    <div class="cols">
+      <div>
+        <div data-lang="en" class="active"><strong>Built on</strong><br><a href="https://huggingface.co/LiquidAI/LFM2.5-Encoder-350M-Prompt-Router">LiquidAI/LFM2.5-Encoder-350M-Prompt-Router</a><br>LFM Open License v1.0</div>
+        <div data-lang="pt"><strong>Construído sobre</strong><br><a href="https://huggingface.co/LiquidAI/LFM2.5-Encoder-350M-Prompt-Router">LiquidAI/LFM2.5-Encoder-350M-Prompt-Router</a><br>LFM Open License v1.0</div>
+      </div>
+      <div>
+        <div data-lang="en" class="active"><strong>Repository</strong><br><a href="https://github.com/eletroswing/router">github.com/eletroswing/router</a></div>
+        <div data-lang="pt"><strong>Repositório</strong><br><a href="https://github.com/eletroswing/router">github.com/eletroswing/router</a></div>
+      </div>
+    </div>
+    <div data-lang="en" class="active">All numbers reproducible via <code>study/*.py</code> — see <a href="https://github.com/eletroswing/router/blob/main/study/latency_findings.md">study/latency_findings.md</a> for the complete write-up.</div>
+    <div data-lang="pt">Todos os números reproduzíveis via <code>study/*.py</code> — ver <a href="https://github.com/eletroswing/router/blob/main/study/latency_findings.md">study/latency_findings.md</a> pro registro completo.</div>
+  </div>
+</footer>
+
+<script>
+  function setLang(lang){
+    document.querySelectorAll('[data-lang]').forEach(function(el){
+      el.classList.toggle('active', el.getAttribute('data-lang') === lang);
+    });
+    document.getElementById('btn-en').classList.toggle('active', lang === 'en');
+    document.getElementById('btn-pt').classList.toggle('active', lang === 'pt');
+    try { localStorage.setItem('router-lang', lang); } catch(e) {}
+  }
+  (function(){
+    var saved = 'en';
+    try { saved = localStorage.getItem('router-lang') || 'en'; } catch(e) {}
+    setLang(saved);
+  })();
+</script>
+
+</body>
+</html>
