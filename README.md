@@ -19,8 +19,8 @@ pass at call time. Each option can carry a written criterion, and the model can 
 It is a ternary [BitNet b1.58](https://arxiv.org/abs/2402.17764) model (20 blocks, 700M-class) with a
 choice head, and the whole decision is a single forward pass.
 
-- **Fast on CPU.** A native runtime with hand-written ternary int8 kernels (AVX-VNNI / AVX2): about 80 ms
-  for a news article and 280 ms for a long JSON decision on a laptop i9.
+- **Fast on CPU.** A native runtime with hand-written ternary int8 kernels (AVX-VNNI / AVX2): about 55 ms
+  for a news article and 200 ms for a long JSON decision on a laptop i9.
 - **Uses the GPU by itself** (CUDA) when one is available.
 - **Small.** The weights are -1, 0 or +1, stored in 2 bits: a 333 MB download, cached after the first
   load.
@@ -149,6 +149,7 @@ const model = await DecisionModel.load(dir?, { device, cpuRuntime, threads });
 | `DECISION_CACHE` | Download cache folder (default `~/.cache/bitnet-decision/`). |
 | `HF_TOKEN` | Token for a private model repository. |
 | `ROUTER_CUDA_PATH` | Folder with the CUDA 13 cuBLAS and cuDNN 9 DLLs (Windows). |
+| `BITNET_EXACT_HEAD=1` | Native runtime: run the choice head in fp32 instead of int8 (about 15% slower, same answers on the parity set). |
 
 ### Good to know
 
@@ -171,12 +172,14 @@ The native CPU runtime gives the reference's answer on all of `benchmark/parity.
 by a few answers on the full sets: BitNet rounds activations to int8, so tiny float differences flip
 near-ties.
 
-Latency per decision (i9-14900HX laptop, RTX 4090 Laptop):
+Latency per decision, one decision at a time (i9-14900HX laptop with desktop apps running, RTX 4090
+Laptop; CPU timings vary by about ±30% with background load):
 
 | | Emotion (~60 tokens) | AG News (~90) | Typed Decisions (~315) |
 | --- | ---: | ---: | ---: |
-| Native CPU runtime | ~50 ms | ~80 ms | ~280 ms |
-| ONNX Runtime CPU | ~75 ms | ~105 ms | ~370 ms |
+| Native CPU runtime, 16 threads | ~35 ms | ~55 ms | ~200 ms |
+| Native CPU runtime, 1 thread | ~0.2 s | ~0.35 s | ~1.7 s |
+| ONNX Runtime CPU, 16 threads | ~75 ms | ~105 ms | ~370 ms |
 | CUDA | ~25 ms | ~25 ms | ~40 ms |
 
 ## Platform support
@@ -202,8 +205,13 @@ cuDNN there or in `ROUTER_CUDA_PATH`. Without them, `"auto"` uses the CPU.
     on 6×16 register tiles with `vpdpbusd`, with the residual add and SwiGLU fused into the GEMM.
   - RMSNorm is fused with the activation quantization.
   - Attention computes only the keys a query may see.
-  - The head's last layer runs only on the option rows.
+  - The choice head runs on the same int8 kernel (7-bit per-channel weights); its last layer runs only
+    on the option rows.
   - A work-sharing pool balances hybrid P/E cores.
+- **Where the time goes.** About 75% of a forward is the ternary GEMM, whose kernel matches ONNX
+  Runtime's own int8 GEMM (MLAS) at ~0.47 TOPS per core, the AVX-VNNI ceiling of this CPU. Each token
+  costs ~1.1 G multiply-adds, so a 315-token decision is ~360 GOP. A single core cannot go much below
+  ~0.8 s for it; more cores, a GPU, or fewer tokens are what make it faster.
 - **Model files.** The ternary layers are stored 2 bits per weight, losslessly; embeddings and head are
   fp16. One `weights.bin` serves the native runtime and both ONNX graphs, which unpack it once at load.
 
@@ -218,9 +226,4 @@ bun run evaluate                 # accuracy and latency on benchmark/
 bun run build:native             # rebuild the native binding
 python scripts/pack-model.py <exported> <packed>   # 2-bit / fp16 packing of an exported model
 ```
-
-The training checkpoint (`best.pt`) and its calibration (`calibration.json`) are in
-[fountaii/router](https://huggingface.co/fountaii/router). The model was distilled from od1 +
-[OpenDecider-nano](https://huggingface.co/manjunathshiva/opendecider-nano) (Typed Decisions) and
-DeBERTa-v3-large + Qwen3-4B (AG News) teachers.
 
