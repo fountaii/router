@@ -71,7 +71,18 @@ export type NativeTensorCtor = new (
   dims: number[],
 ) => TensorObject
 
+/** native CPU runtime of the BitNet decision model (src/native/bitnet_avx2.cc) */
+export type NativeBitnet = {
+  run(ids: Int32Array, positions: Int32Array, segments: Int32Array, markers: Int32Array): Promise<Float32Array>;
+  release(): void;
+}
+
 export type OrtBinding = {
+  BitnetModel: {
+    load(weightsPath: string, tensors: Record<string, unknown>, config: Record<string, number>,
+      threads: number): Promise<NativeBitnet>;
+  };
+  bitnetCpu: () => { supported: boolean; kernel: "avx-vnni" | "avx2" | "none" };
   InferenceSession: new () => NativeSession;
   listSupportedBackends: () => Array<{
     name: string;

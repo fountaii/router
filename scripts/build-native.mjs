@@ -13,7 +13,11 @@ const build = path.join(root, '.cache/native', target);
 const output = path.join(build, 'onnxruntime_binding.node');
 const includes = [path.join(native, 'include'), path.join(native, 'include/node'),
   path.dirname(require.resolve('node-addon-api/package.json'))];
-const sources = readdirSync(native).filter(file => file.endsWith('.cc')).map(file => path.join(native, file));
+const sources = readdirSync(native).filter(file => file.endsWith('.cc') && !file.endsWith('_avx2.cc'))
+  .map(file => path.join(native, file));
+// *_avx2.cc hold the BitNet kernels: compiled with AVX2/FMA on their own, entered only after a CPUID check.
+const avx2Sources = process.arch === 'x64'
+  ? readdirSync(native).filter(file => file.endsWith('_avx2.cc')).map(file => path.join(native, file)) : [];
 const definitions = ['NAPI_VERSION=8', 'NAPI_CPP_EXCEPTIONS', 'ORT_API_MANUAL_INIT'];
 const runtimeName = process.platform === 'win32' ? 'onnxruntime.dll'
   : process.platform === 'linux' ? 'libonnxruntime.so.1' : 'libonnxruntime.1.dylib';
@@ -47,9 +51,13 @@ if (process.platform === 'win32') {
   const quote = value => `"${value}"`;
   const args = ['/nologo', '/LD', '/O2', '/EHsc', '/std:c++17', '/MD', '/utf-8', '/DHOST_BINARY=\\"node.exe\\"',
     ...definitions.map(value => `/D${value}`), ...includes.map(value => `/I${quote(value)}`),
-    ...sources.map(quote), quote(path.join(native, 'lib/win32', process.arch, 'node.lib')),
+    ...sources.map(quote), ...avx2Sources.map(file => quote(path.join(build, path.basename(file, '.cc') + '.obj'))),
+    quote(path.join(native, 'lib/win32', process.arch, 'node.lib')),
     quote(path.join(build, 'onnxruntime.lib')), '/link', 'delayimp.lib', '/DELAYLOAD:node.exe', `/OUT:${quote(output)}`];
   writeFileSync(path.join(build, 'compile.rsp'), args.join(' '));
+  const avx2Args = ['/nologo', '/c', '/O2', '/arch:AVX2', '/EHsc', '/std:c++17', '/MD', '/utf-8',
+    ...includes.map(value => `/I${quote(value)}`), ...avx2Sources.map(quote)];
+  writeFileSync(path.join(build, 'avx2.rsp'), avx2Args.join(' '));
   const batch = path.join(build, 'build.cmd');
   writeFileSync(batch, [
     '@echo off',
@@ -57,14 +65,21 @@ if (process.platform === 'win32') {
     'if errorlevel 1 exit /b %errorlevel%',
     `lib /nologo /def:onnxruntime.def /machine:${process.arch} /out:onnxruntime.lib`,
     'if errorlevel 1 exit /b %errorlevel%',
+    ...(avx2Sources.length ? ['cl @avx2.rsp', 'if errorlevel 1 exit /b %errorlevel%'] : []),
     'cl @compile.rsp',
     'exit /b %errorlevel%', '',
   ].join('\r\n'));
   run(process.env.ComSpec ?? 'cmd.exe', ['/d', '/c', batch]);
 } else if (['linux', 'darwin'].includes(process.platform)) {
+  const objects = avx2Sources.map(file => {
+    const object = path.join(build, path.basename(file, '.cc') + '.o');
+    run(process.env.CXX ?? 'c++', ['-std=c++17', '-O2', '-fPIC', '-mavx2', '-mfma', '-mf16c', '-c',
+      ...includes.flatMap(value => ['-I', value]), file, '-o', object]);
+    return object;
+  });
   run(process.env.CXX ?? 'c++', ['-std=c++17', '-O2', '-fPIC', '-shared', '-pthread',
     ...definitions.map(value => `-D${value}`), ...includes.flatMap(value => ['-I', value]),
-    ...sources, runtime,
+    ...sources, ...objects, runtime,
     ...(process.platform === 'linux' ? ['-Wl,-rpath,$ORIGIN'] : ['-undefined', 'dynamic_lookup', '-Wl,-rpath,@loader_path']),
     '-o', output]);
 } else {
