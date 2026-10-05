@@ -3,10 +3,8 @@ import fs from "node:fs";
 import { createRequire } from "node:module";
 import type { OrtBinding } from "./types.ts"
 
-const binDir = path.resolve(
-  import.meta.dirname,
-  `./bin/${process.platform}/${process.arch}`,
-);
+// From the package root: the same path from src/onnx/ (Bun, a clone) and dist/onnx/ (Node).
+const binDir = path.resolve(import.meta.dirname, "../../src/onnx/bin", process.platform, process.arch);
 
 // O provider de CUDA precisa do cuBLAS e do cuDNN, que nao sao embarcados (~900
 // MB). Procura ao lado do binding e nos diretorios de ROUTER_CUDA_PATH; aumentar

@@ -41,3 +41,15 @@ src/onnx/bin/*/*/onnxruntime_providers_cuda.dll
 # sobras do estudo TensorRT (ver study/latency_findings.md)
 TensorrtExecutionProvider_*.onnx
 onnxruntime_profile__*.json
+
+# local model folders (DECISION_MODEL_DIR)
+models/
+
+# benchmark
+benchmark
+
+# IDE
+.vscode
+
+# compiled for Node on install (scripts/build.mjs)
+dist/

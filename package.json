@@ -1,20 +1,43 @@
 {
-  "name": "router",
-  "module": "index.ts",
+  "name": "@fountaii/router",
+  "version": "0.1.0",
+  "description": "Ternary BitNet b1.58 typed-decision model for Bun/Node: native CPU runtime, automatic CUDA, model downloaded from Hugging Face.",
   "type": "module",
-  "private": true,
-  "devDependencies": {
-    "@types/bun": "latest",
-    "node-addon-api": "^8.9.2"
+  "main": "dist/index.js",
+  "types": "src/index.ts",
+  "exports": {
+    ".": {
+      "types": "./src/index.ts",
+      "bun": "./src/index.ts",
+      "default": "./dist/index.js"
+    }
   },
-  "peerDependencies": {
-    "typescript": "^7"
+  "files": [
+    "dist",
+    "src",
+    "scripts/build.mjs",
+    "scripts/build-native.mjs"
+  ],
+  "engines": {
+    "node": ">=22.13"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/fountaii/router.git"
+  },
+  "scripts": {
+    "prepare": "node --no-warnings scripts/build.mjs",
+    "build": "node --no-warnings scripts/build.mjs",
+    "build:native": "node scripts/build-native.mjs",
+    "test": "node --test src/decision.test.ts",
+    "evaluate": "node scripts/evaluate.ts benchmark/typed-decisions-test.jsonl benchmark/ag-news-test.jsonl benchmark/emotion-validation-val.jsonl",
+    "demo": "node index.ts"
   },
   "dependencies": {
     "tokenizers": "^0.23.2"
   },
-  "scripts": {
-    "build:native": "node scripts/build-native.mjs",
-    "build:model": "node scripts/build-model.mjs"
+  "devDependencies": {
+    "@types/bun": "latest",
+    "node-addon-api": "^8.9.2"
   }
 }
