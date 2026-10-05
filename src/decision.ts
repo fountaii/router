@@ -7,7 +7,7 @@ import os from "node:os";
 import path from "node:path";
 import { Tokenizer } from "tokenizers";
 
-import { ensureModel } from "./download.ts";
+import { ensureCuda, ensureModel } from "./download.ts";
 import { binding, cudaRuntimeDir } from "./onnx/binding.ts";
 import { createSession, listSupportedBackends, Tensor, type Session } from "./onnx/index.ts";
 
@@ -123,6 +123,7 @@ export class DecisionModel {
     const config = JSON.parse(fs.readFileSync(path.join(dir, "config.json"), "utf8")) as Config;
     const tokenizer = Tokenizer.fromFile(path.join(dir, "tokenizer.json"));
     const wanted = (process.env["DECISION_DEVICE"] as Device | undefined) ?? device;
+    if (wanted !== "cpu") await ensureCuda();  // first use with an NVIDIA GPU: ~700 MB of CUDA runtime
     const cuda = wanted !== "cpu" && cudaRuntimeDir() !== undefined &&
       listSupportedBackends().some(b => b.name === "cuda");
     if (wanted === "cuda" && !cuda) throw new Error("CUDA was requested but its provider or runtime libraries are missing.");
