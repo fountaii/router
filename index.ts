@@ -1,53 +1,35 @@
-import { inferenceThreads, Lfm2Router, route, getTokenizer } from "./src/router.ts"
+// Demo: load the BitNet decision model (downloaded once from fountaii/router; CUDA when available,
+// else the native CPU runtime) and decide two cases.
+//   node index.ts            DECISION_DEVICE=cpu node index.ts
+import { DecisionModel } from "./src/decision.ts";
 
-async function main() {
-    const HF_TOKEN = process.env["HF_TOKEN"]
-    const CPUS = inferenceThreads()
+const model = await DecisionModel.load();
+console.log(`device: ${model.device}, runtime: ${model.runtime}`);
 
-    console.time("tokenizer")
-    const TOK = await getTokenizer()
-    console.timeEnd("tokenizer")
+const cases = [
+  {
+    question: "What is this news article about?",
+    state: "Chipmaker shares jump after record quarterly profit. Intel said on Tuesday that demand for server processors drove revenue above analysts' forecasts.",
+    choices: ["World", "Sports", "Business", "Sci/Tech"],
+  },
+  {
+    question: "What should the assistant do next with this conversation?\nCriteria: " + JSON.stringify({
+      answer_directly: "The assistant can resolve this itself with information it already has.",
+      escalate_to_human: "A human agent must take over.",
+      execute_refund: "Issue the refund the customer is entitled to.",
+      request_information: "Ask the customer for what is missing before acting.",
+    }),
+    state: JSON.stringify({
+      conversation: "Customer: I was charged twice for order 1182 last week. Please refund the duplicate today.",
+      account: { plan: "pro", tenure_months: 26, open_tickets: 0 },
+    }),
+    choices: ["answer_directly", "escalate_to_human", "execute_refund", "request_information"],
+  },
+];
 
-    // ROUTER_EP=cuda usa a GPU; precisa de `bun run build:model -- --gpu` antes.
-    const executionProviders = (process.env["ROUTER_EP"] ?? "cuda").split(",")
-
-    console.time("model")
-    const model = await Lfm2Router.fromHub({
-        numThreads: CPUS,
-        token: HF_TOKEN,
-        executionProviders
-    })
-    console.timeEnd("model")
-    console.log("[boot] providers:", executionProviders.join(","))
-
-    console.time("warmup")
-    const warmup = await route({
-        model,
-        tok: TOK,
-        text: "Set a timer.",
-        cats: ["Simple tool use", "Creative writing"]
-    })
-    console.timeEnd("warmup")
-
-    // Uma chamada isolada mede o caminho frio (JIT, clocks da GPU) e da ~1 ms a
-    // mais que o regime. O p50 e o numero que vale.
-    const samples: number[] = []
-    let hot = warmup
-    for (let i = 0; i < 100; i++) {
-        const start = performance.now()
-        hot = await route({
-            model,
-            tok: TOK,
-            text: "Set a timer.",
-            cats: ["Simple tool use", "Creative writing"]
-        })
-        samples.push(performance.now() - start)
-    }
-    samples.sort((a, b) => a - b)
-    console.log(`route: p50 ${samples[50]!.toFixed(2)}ms p95 ${samples[95]!.toFixed(2)}ms`)
-
-    console.log("[boot] router ready")
-    console.log(hot)
+for (const input of cases) {
+  const start = performance.now();
+  const decision = await model.decide(input);
+  console.log(`${(performance.now() - start).toFixed(1)} ms`, decision);
 }
-
-main()
+await model.release();
