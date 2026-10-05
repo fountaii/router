@@ -21,7 +21,7 @@ choice head, and the whole decision is a single forward pass.
 
 - **Fast on CPU.** A native runtime with hand-written ternary int8 kernels (AVX-VNNI / AVX2): about 55 ms
   for a news article and 200 ms for a long JSON decision on a laptop i9.
-- **Uses the GPU by itself** (CUDA) when one is available.
+- **Uses the GPU by itself** (CUDA) when one is available; on Windows the CUDA runtime downloads on first use.
 - **Small.** The weights are -1, 0 or +1, stored in 2 bits: a 333 MB download, cached after the first
   load.
 - **Dynamic options.** No fixed label set: choices, yes/no and ordinal scores, each with its own criteria.
@@ -71,7 +71,9 @@ await model.release();
 | `context` | `string?` | Extra context. |
 | `history` | `string?` | Earlier turns or events. |
 
-The whole prompt must fit in 2,048 tokens; longer inputs throw.
+The native CPU runtime takes prompts up to 16,384 tokens (`maxTokens`) with a sliding attention window
+of 2,048 positions, the model's pretraining context. ONNX Runtime and CUDA take up to 2,048 tokens.
+Longer inputs throw.
 
 ### Question types
 
@@ -135,16 +137,17 @@ const model = await DecisionModel.load(dir?, { device, cpuRuntime, threads });
 | Option | Default | |
 | --- | --- | --- |
 | `dir` | downloaded model | A local model folder instead of the Hugging Face download. |
-| `device` | `"auto"` | `"auto"`, `"cpu"` or `"cuda"`. `"auto"` uses CUDA when its libraries are present. |
+| `device` | `"auto"` | `"auto"`, `"cpu"` or `"cuda"`. `"auto"` uses CUDA when an NVIDIA GPU is present. |
 | `cpuRuntime` | `"auto"` | `"native"` (x86-64 with AVX2), `"onnx"` (ONNX Runtime) or `"auto"`. |
 | `threads` | min(16, logical CPUs / 2) | CPU threads. |
+| `maxTokens` | 16,384 native, 2,048 ONNX/CUDA | Longest prompt accepted. Long prompts cost time and memory: ~3 s at 2k tokens, ~19 s at 8k (native, 16 threads). |
 
 `model.device` (`"cpu"` / `"cuda"`) and `model.runtime` (`"native-avx-vnni"`, `"native-avx2"`,
 `"onnx-cpu"`, `"onnx-cuda"`) tell what was picked.
 
 | Environment variable | |
 | --- | --- |
-| `DECISION_DEVICE`, `DECISION_CPU_RUNTIME`, `DECISION_THREADS` | Same as the options above. |
+| `DECISION_DEVICE`, `DECISION_CPU_RUNTIME`, `DECISION_THREADS`, `DECISION_MAX_TOKENS` | Same as the options above. |
 | `DECISION_MODEL_DIR` | Use a local model folder. |
 | `DECISION_CACHE` | Download cache folder (default `~/.cache/bitnet-decision/`). |
 | `HF_TOKEN` | Token for a private model repository. |
@@ -186,12 +189,13 @@ Laptop; CPU timings vary by about ±30% with background load):
 
 | Platform | Native CPU | ONNX CPU | CUDA |
 | --- | :---: | :---: | :---: |
-| Windows x64 | ✅ prebuilt | ✅ prebuilt | ✅ with the CUDA runtime DLLs¹ |
+| Windows x64 | ✅ prebuilt | ✅ prebuilt | ✅ auto-download¹ |
 | Linux / macOS x64 | `bun run build:native`² | `build:native`² | Linux, `build:native`² |
 | ARM64 | — | `build:native`² | — |
 
-¹ `onnxruntime_providers_cuda.dll` next to `onnxruntime.dll` in `src/onnx/bin/win32/x64/`, plus cuBLAS and
-cuDNN there or in `ROUTER_CUDA_PATH`. Without them, `"auto"` uses the CPU.
+¹ With an NVIDIA driver installed, the first GPU load downloads the CUDA provider, cuBLAS and cuDNN
+(~730 MB) from the model repository into `src/onnx/bin/win32/x64/`. Without a driver, `"auto"` uses the
+CPU. `device: "cpu"` skips the download.
 ² Needs a C++ compiler and the ONNX Runtime shared library in `src/native/lib/<platform>/<arch>/`.
 
 ## How it works
