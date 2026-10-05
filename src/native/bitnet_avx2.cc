@@ -426,20 +426,25 @@ void DenseGemm(Pool& pool, const float* a, size_t lda, int M, const Dense& w, fl
 
 // ---------------------------------------------------------------------------------- attention
 
-// One block of up to MR queries of one head (same segment), against keys [0, nk_a) and, for an
-// option branch, its own keys [b0, b0 + nk_b). keys_t: [d][stride] (transposed keys, zero padded),
-// values: row t at values + t * ldv. causal_end[r]: last key index query r may see (inclusive).
+// One block of up to MR queries of one head (same segment), against the shared keys [a0, a0 + nk_a)
+// (a0 a multiple of 16) and, for an option branch, its own keys [b0, b0 + nk_b). keys_t: the head's
+// keys in tiles of 16, [key / 16][d][16] (zero padded); values: the head's [key][d]. Query r sees shared
+// keys first_key[r]..last_key[r] (sliding window and causality) and its branch's keys up to last_key[r].
 template <int R>
-void AttentionBlock(const float* q, size_t ldq, const float* keys_t, size_t kstride, const float* values,
-                    size_t ldv, int d, int nk_a, int b0, int nk_b, const int* last_key, float scale,
+void AttentionBlock(const float* q, size_t ldq, const float* keys_t, const float* values, int d, int a0,
+                    int nk_a, int b0, int nk_b, const int* first_key, const int* last_key, float scale,
                     float* scores, size_t lds, float* out, size_t ldo) {
+  // The branch range starts at its tile too: the keys before b0 there belong to other segments (masked).
+  const int skip_b = nk_b ? b0 % 16 : 0;
+  b0 -= skip_b;
+  nk_b += skip_b;
   // scores[r][0..nk_a) = q . k for the shared keys, scores[r][nk_a..) for the branch's own keys
-  const int ranges[2][2] = {{0, nk_a}, {b0, nk_b}};
+  const int ranges[2][2] = {{a0, nk_a}, {b0, nk_b}};
   int at = 0;
   for (const auto& range : ranges) {
     for (int j = 0; j < range[1]; j += NR) {
       __m256 acc[R][2];
-      FloatTile<R>(q, ldq, keys_t + range[0] + j, kstride, d, acc);
+      FloatTile<R>(q, ldq, keys_t + static_cast<size_t>((range[0] + j) / 16) * d * 16, 16, d, acc);
       for (int r = 0; r < R; ++r) {
         _mm256_storeu_ps(scores + r * lds + at + j, _mm256_mul_ps(acc[r][0], _mm256_set1_ps(scale)));
         _mm256_storeu_ps(scores + r * lds + at + j + 8, _mm256_mul_ps(acc[r][1], _mm256_set1_ps(scale)));
@@ -452,8 +457,10 @@ void AttentionBlock(const float* q, size_t ldq, const float* keys_t, size_t kstr
     float* s = scores + r * lds;
     // mask keys past the query (causal). Score i is key i (shared range) or key b0 + i - nk_a (the
     // branch's own range); keys grow with i in each range, so only each range's tail needs masking.
-    for (int i = std::max(0, last_key[r] + 1); i < nk_a; ++i) s[i] = kNeg;
+    for (int i = std::max(0, last_key[r] + 1 - a0); i < nk_a; ++i) s[i] = kNeg;
+    for (int i = 0; i < std::min(nk_a, first_key[r] - a0); ++i) s[i] = kNeg;
     if (nk_b) for (int i = nk_a + std::max(0, last_key[r] + 1 - b0); i < total; ++i) s[i] = kNeg;
+    for (int i = nk_a; i < nk_a + skip_b; ++i) s[i] = kNeg;
     for (int i = total; i < (total + 7) / 8 * 8; ++i) s[i] = kNeg;
     __m256 mx = _mm256_set1_ps(kNeg);
     for (int i = 0; i < total; i += 8) mx = _mm256_max_ps(mx, _mm256_loadu_ps(s + i));
@@ -470,9 +477,9 @@ void AttentionBlock(const float* q, size_t ldq, const float* keys_t, size_t kstr
   // out[r][0..d) = sum_i p[r][i] * v(key i)
   for (int c = 0; c < d; c += NR) {
     __m256 acc[R][2], part[R][2];
-    FloatTile<R>(scores, lds, values + c, ldv, nk_a, acc);
+    FloatTile<R>(scores, lds, values + static_cast<size_t>(a0) * d + c, d, nk_a, acc);
     if (nk_b) {
-      FloatTile<R>(scores + nk_a, lds, values + static_cast<size_t>(b0) * ldv + c, ldv, nk_b, part);
+      FloatTile<R>(scores + nk_a, lds, values + static_cast<size_t>(b0) * d + c, d, nk_b, part);
       for (int r = 0; r < R; ++r) {
         acc[r][0] = _mm256_add_ps(acc[r][0], part[r][0]);
         acc[r][1] = _mm256_add_ps(acc[r][1], part[r][1]);
@@ -485,21 +492,30 @@ void AttentionBlock(const float* q, size_t ldq, const float* keys_t, size_t kstr
   }
 }
 
-// Transposes the keys of every head: keys_t[h][j][t] = k[t][h*d + j] (rows zero padded to stride).
-void TransposeKeys(Pool& pool, const float* k, size_t ldk, int M, int heads, int d, float* keys_t, size_t stride) {
-  pool.For(heads, [&](int h) {
-    float* dst = keys_t + static_cast<size_t>(h) * d * stride;
-    for (int t = 0; t < M; ++t) {
-      const float* src = k + t * ldk + h * d;
-      for (int j = 0; j < d; ++j) dst[j * stride + t] = src[j];
+// Lays out the keys and values of every head for AttentionBlock: keys_t[h] = [tile][d][16] (keys t of
+// tile t / 16, zero padded to `tiles` tiles) and values[h] = [t][d], both contiguous per head.
+void PackKeysValues(Pool& pool, const float* k, const float* v, size_t ld, int M, int heads, int d,
+                    int tiles, float* keys_t, float* values) {
+  pool.For(heads * 2, [&](int item) {
+    const int h = item / 2;
+    if (item % 2) {
+      float* dst = values + static_cast<size_t>(h) * M * d;
+      for (int t = 0; t < M; ++t) std::memcpy(dst + static_cast<size_t>(t) * d, v + t * ld + h * d, d * sizeof(float));
+      return;
     }
-    for (int j = 0; j < d; ++j) std::memset(dst + j * stride + M, 0, (stride - M) * sizeof(float));
+    float* dst = keys_t + static_cast<size_t>(h) * tiles * d * 16;
+    std::memset(dst, 0, static_cast<size_t>(tiles) * d * 16 * sizeof(float));
+    for (int t = 0; t < M; ++t) {
+      const float* src = k + t * ld + h * d;
+      float* tile = dst + static_cast<size_t>(t / 16) * d * 16 + t % 16;
+      for (int j = 0; j < d; ++j) tile[j * 16] = src[j];
+    }
   });
 }
 
-struct QueryBlock { int start, count, keys_a, branch_start, keys_b; };
+struct QueryBlock { int start, count, keys_a_start, keys_a, branch_start, keys_b; };
 
-// BITNET_PROFILE=1: time per stage, printed every 20 forwards.
+// BITNET_PROFILE=N: time per stage, averaged and printed every N forwards.
 struct Profile {
   const bool on = std::getenv("BITNET_PROFILE") != nullptr;
   double ms[16] = {};
@@ -513,7 +529,8 @@ struct Profile {
     last = now;
   }
   void End() {
-    if (!on || ++runs % 20) return;
+    static const int every = std::max(1, std::atoi(on ? std::getenv("BITNET_PROFILE") : "1"));
+    if (!on || ++runs % every) return;
     static const char* names[] = {"embed", "norm+quant", "ternary gemm", "rope", "attention", "final norm",
                                   "head gemm", "head attention", "head layernorm", "scorer"};
     std::fprintf(stderr, "[bitnet] ms per forward:");
@@ -557,6 +574,8 @@ class Model {
   bool vnni = false;
   std::unique_ptr<Pool> pool;
   Buf<float> embed, rope_cos, rope_sin, final_norm;
+  int rope_rows = 0;      // positions in the stored RoPE table; later ones are computed
+  float inv_freq[128] = {};
   std::vector<Layer> layers;
   bool int8_head = true;
   HeadLinear proj, scorer1;
@@ -565,7 +584,7 @@ class Model {
   float scorer3_b = 0;
 
   // workspace (grown on demand)
-  Buf<float> h, qkv, attn, mlp, keys_t, rowscale, z, x, kv, qh, ff, zq, xq;
+  Buf<float> h, qkv, attn, mlp, keys_t, values, rowscale, z, x, kv, qh, ff, zq, xq;
   Buf<uint8_t> act;
   std::mutex busy;
 };
@@ -747,6 +766,12 @@ Model* Load(const std::string& path, const std::map<std::string, Source>& tensor
   rd.Floats("embed", model->embed);
   rd.Floats("rope.cos", model->rope_cos);
   rd.Floats("rope.sin", model->rope_sin);
+  {
+    const int d = cfg.hidden / cfg.heads;
+    model->rope_rows = static_cast<int>(rd.Shape("rope.cos")[0]);
+    for (int j = 0; j < d / 2; ++j)  // BitnetRotaryEmbedding: 1 / base ** (arange(0, d, 2) / d), float32
+      model->inv_freq[j] = 1.0f / std::pow(10000.0f, static_cast<float>(2 * j) / static_cast<float>(d));
+  }
   rd.Floats("model.norm", model->final_norm);
   model->layers.resize(cfg.layers);
   for (int i = 0; i < cfg.layers; ++i) {
@@ -793,11 +818,12 @@ namespace {
 // Self-attention of one layer. q/k/v: rows of `qkv` (stride ldq) at column offsets 0, hidden, 2*hidden.
 void Attend(Model& m, const float* qkv, size_t ldq, int qcol, int kcol, int vcol, int heads, int d,
             const std::vector<QueryBlock>& blocks, const int* row_of, int keys, float* out, size_t ldo,
-            const std::vector<int>& last_key) {
-  const size_t stride = static_cast<size_t>(keys + 2 * NR + 15) / 16 * 16;
-  m.keys_t.resize(static_cast<size_t>(heads) * d * stride);
-  TransposeKeys(*m.pool, qkv + kcol, ldq, keys, heads, d, m.keys_t.get(), stride);
-  const size_t lds = stride + 16;
+            const std::vector<int>& first_key, const std::vector<int>& last_key) {
+  const int tiles = (keys + 15) / 16 + 2;  // slack: an aligned 16-key chunk may run past the last key
+  m.keys_t.resize(static_cast<size_t>(heads) * tiles * d * 16);
+  m.values.resize(static_cast<size_t>(heads) * keys * d + 16);
+  PackKeysValues(*m.pool, qkv + kcol, qkv + vcol, ldq, keys, heads, d, tiles, m.keys_t.get(), m.values.get());
+  const size_t lds = static_cast<size_t>(tiles) * 16 + 16;
   const int items = static_cast<int>(blocks.size()) * heads;
   const float scale = 1.0f / std::sqrt(static_cast<float>(d));
   m.pool->For(items, [&](int item) {
@@ -805,12 +831,13 @@ void Attend(Model& m, const float* qkv, size_t ldq, int qcol, int kcol, int vcol
     const QueryBlock& b = blocks[item / heads];
     float* s = Scratch(MR * lds);
     const float* q = qkv + static_cast<size_t>(row_of[b.start]) * ldq + qcol + h * d;
-    const float* kt = m.keys_t.get() + static_cast<size_t>(h) * d * stride;
-    const float* v = qkv + vcol + h * d;
+    const float* kt = m.keys_t.get() + static_cast<size_t>(h) * tiles * d * 16;
+    const float* v = m.values.get() + static_cast<size_t>(h) * keys * d;
     float* o = out + static_cast<size_t>(row_of[b.start]) * ldo + h * d;
+    const int* fk = first_key.data() + b.start;
     const int* lk = last_key.data() + b.start;
     switch (b.count) {
-#define CASE(n) case n: AttentionBlock<n>(q, ldq, kt, stride, v, ldq, d, b.keys_a, b.branch_start, b.keys_b, lk, scale, s, lds, o, ldo); break;
+#define CASE(n) case n: AttentionBlock<n>(q, ldq, kt, v, d, b.keys_a_start, b.keys_a, b.branch_start, b.keys_b, fk, lk, scale, s, lds, o, ldo); break;
       CASE(1) CASE(2) CASE(3) CASE(4) CASE(5) CASE(6)
 #undef CASE
       default: break;
@@ -864,6 +891,9 @@ std::vector<float> Forward(Model& m, const int32_t* ids, const int32_t* position
   for (int t = 0; t < n; ++t) rows[t] = t;
   // Query blocks never cross a segment. causal: prefix query t sees [0, t]; a branch query sees the
   // prefix and its branch up to itself. bidirectional prefix: prefix queries see the whole prefix.
+  // Every query sees only shared keys within `window` RoPE positions (prefix keys sit at their index),
+  // so inputs longer than the pretraining context never attend farther than it.
+  const int win = c.window;
   auto blocks_for = [&](bool bidir) {
     std::vector<QueryBlock> out;
     for (int t = 0; t < n;) {
@@ -872,18 +902,20 @@ std::vector<float> Forward(Model& m, const int32_t* ids, const int32_t* position
       if (!in_prefix) while (end < n && segments[end] == segments[t]) ++end;
       for (int s = t; s < end; s += MR) {
         const int cnt = std::min(MR, end - s);
-        if (in_prefix) out.push_back({s, cnt, bidir ? prefix : s + cnt, 0, 0});
-        else out.push_back({s, cnt, prefix, branch_start[s], s + cnt - branch_start[s]});
+        const int a0 = std::min(prefix, std::max(0, positions[s] - win + 1)) / 16 * 16;
+        if (in_prefix) out.push_back({s, cnt, a0, (bidir ? std::min(prefix, s + cnt - 1 + win) : s + cnt) - a0, 0, 0});
+        else out.push_back({s, cnt, a0, prefix - a0, branch_start[s], s + cnt - branch_start[s]});
       }
       t = end;
     }
     return out;
   };
   const auto causal_blocks = blocks_for(false), bidir_blocks = blocks_for(true);
-  std::vector<int> last_causal(n), last_bidir(n);
+  std::vector<int> first_key(n), last_causal(n), last_bidir(n);
   for (int t = 0; t < n; ++t) {
+    first_key[t] = std::max(0, positions[t] - win + 1);
     last_causal[t] = t;
-    last_bidir[t] = t < prefix ? prefix - 1 : t;
+    last_bidir[t] = t < prefix ? std::min(prefix - 1, t + win - 1) : t;
   }
 
   const size_t ldq = static_cast<size_t>(3) * H;
@@ -900,6 +932,16 @@ std::vector<float> Forward(Model& m, const int32_t* ids, const int32_t* position
       for (int t = item * 16; t < std::min(n, item * 16 + 16); ++t) {
         const float* cs = m.rope_cos.get() + static_cast<size_t>(positions[t]) * d;
         const float* sn = m.rope_sin.get() + static_cast<size_t>(positions[t]) * d;
+        thread_local float far_cos[256], far_sin[256];
+        if (positions[t] >= m.rope_rows) {  // past the stored table: the model's own RoPE formula
+          for (int j = 0; j < d / 2; ++j) {
+            const float f = static_cast<float>(positions[t]) * m.inv_freq[j];
+            far_cos[j] = far_cos[j + d / 2] = std::cos(f);
+            far_sin[j] = far_sin[j + d / 2] = std::sin(f);
+          }
+          cs = far_cos;
+          sn = far_sin;
+        }
         for (int part = 0; part < 2; ++part) {
           float* row = m.qkv.get() + t * ldq + part * H;
           for (int hh = 0; hh < heads; ++hh) {
@@ -917,7 +959,7 @@ std::vector<float> Forward(Model& m, const int32_t* ids, const int32_t* position
     });
     profile.Mark(3);
     Attend(m, m.qkv.get(), ldq, 0, H, 2 * H, heads, d, bidir ? bidir_blocks : causal_blocks, rows.data(), n,
-           m.attn.get(), H, bidir ? last_bidir : last_causal);
+           m.attn.get(), H, first_key, bidir ? last_bidir : last_causal);
     profile.Mark(4);
     NormQuant(pool, m.attn.get(), n, H, L.inner_norm.get(), c.rms_eps, m.act.get(), m.rowscale.get());
     profile.Mark(1);
@@ -957,9 +999,9 @@ std::vector<float> Forward(Model& m, const int32_t* ids, const int32_t* position
   HeadGemm(m, h, H, n, m.proj, m.z.get(), W);
   profile.Mark(6);
   std::vector<QueryBlock> all_blocks, marker_blocks;
-  for (int s = 0; s < n; s += MR) all_blocks.push_back({s, std::min(MR, n - s), n, 0, 0});
-  for (int s = 0; s < count; s += MR) marker_blocks.push_back({s, std::min(MR, count - s), n, 0, 0});
-  std::vector<int> full_key(std::max(n, count), n - 1), marker_rows(count);
+  for (int s = 0; s < n; s += MR) all_blocks.push_back({s, std::min(MR, n - s), 0, n, 0, 0});
+  for (int s = 0; s < count; s += MR) marker_blocks.push_back({s, std::min(MR, count - s), 0, n, 0, 0});
+  std::vector<int> full_key(std::max(n, count), n - 1), no_window(std::max(n, count), 0), marker_rows(count);
   for (int i = 0; i < count; ++i) marker_rows[i] = i;
   float* z = m.z.get();
   int rows_now = n;
@@ -984,11 +1026,12 @@ std::vector<float> Forward(Model& m, const int32_t* ids, const int32_t* position
     profile.Mark(6);
     // attention: queries in qh (stride W), keys/values in kv (stride 2W); output into ff (stride W)
     {
-      const size_t stride = static_cast<size_t>(n + 2 * NR + 15) / 16 * 16;
-      m.keys_t.resize(static_cast<size_t>(hh) * 64 * stride);
-      TransposeKeys(pool, m.kv.get(), 2 * W, n, hh, 64, m.keys_t.get(), stride);
+      const int tiles = (n + 15) / 16 + 2;
+      m.keys_t.resize(static_cast<size_t>(hh) * tiles * 64 * 16);
+      m.values.resize(static_cast<size_t>(hh) * n * 64 + 16);
+      PackKeysValues(pool, m.kv.get(), m.kv.get() + W, 2 * W, n, hh, 64, tiles, m.keys_t.get(), m.values.get());
       const auto& blocks = last ? marker_blocks : all_blocks;
-      const size_t lds = stride + 16;
+      const size_t lds = static_cast<size_t>(tiles) * 16 + 16;
       const int items = static_cast<int>(blocks.size()) * hh;
       const float scale = 1.0f / 8.0f;
       pool.For(items, [&](int item) {
@@ -996,11 +1039,11 @@ std::vector<float> Forward(Model& m, const int32_t* ids, const int32_t* position
         const QueryBlock& b = blocks[item / hh];
         float* s = Scratch(MR * lds);
         const float* q = m.qh.get() + static_cast<size_t>(b.start) * W + head * 64;
-        const float* kt = m.keys_t.get() + static_cast<size_t>(head) * 64 * stride;
-        const float* v = m.kv.get() + W + head * 64;
+        const float* kt = m.keys_t.get() + static_cast<size_t>(head) * tiles * 64 * 16;
+        const float* v = m.values.get() + static_cast<size_t>(head) * n * 64;
         float* o = m.ff.get() + static_cast<size_t>(b.start) * W + head * 64;
         switch (b.count) {
-#define CASE(k) case k: AttentionBlock<k>(q, W, kt, stride, v, 2 * W, 64, n, 0, 0, full_key.data(), scale, s, lds, o, W); break;
+#define CASE(k) case k: AttentionBlock<k>(q, W, kt, v, 64, 0, n, 0, 0, no_window.data(), full_key.data(), scale, s, lds, o, W); break;
           CASE(1) CASE(2) CASE(3) CASE(4) CASE(5) CASE(6)
 #undef CASE
           default: break;

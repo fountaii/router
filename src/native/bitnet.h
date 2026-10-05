@@ -13,6 +13,7 @@ struct Config {
   int head_width = 0, head_layers = 0, vocab = 0, max_context = 0;
   float rms_eps = 1e-5f;
   bool exact_head = false;  // fp32 choice head instead of int8 (BITNET_EXACT_HEAD=1)
+  int window = 2048;        // sliding attention window, in RoPE positions (the pretraining context)
 };
 
 // A weight as listed in config.json: stored in weights.bin (offset/length) or inline (data).

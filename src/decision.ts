@@ -36,10 +36,13 @@ export type LoadOptions = {
   cpuRuntime?: "auto" | "native" | "onnx";
   /** CPU threads; defaults to half the logical CPUs, capped at 16 */
   threads?: number;
+  /** longest prompt accepted, in tokens; default 16384 on the native runtime; ONNX Runtime (and CUDA) stops at
+   * config.max_context (2048), its RoPE table. Attention reaches at most `window` positions back. */
+  maxTokens?: number;
 };
 
 type Config = {
-  bos_id: number; abstain: string; max_context: number; temperature: number;
+  bos_id: number; abstain: string; max_context: number; temperature: number; window?: number;
   architecture?: Record<string, number>; tensors?: Record<string, unknown>;
 };
 
@@ -104,7 +107,11 @@ export class DecisionModel {
   private readonly config: Config;
   readonly device: "cpu" | "cuda";
 
-  private constructor(backend: Backend, tokenizer: Tokenizer, config: Config, device: "cpu" | "cuda") {
+  /** longest prompt accepted, in tokens */
+  readonly maxTokens: number;
+
+  private constructor(backend: Backend, tokenizer: Tokenizer, config: Config, device: "cpu" | "cuda", maxTokens: number) {
+    this.maxTokens = maxTokens;
     this.backend = backend;
     this.tokenizer = tokenizer;
     this.config = config;
@@ -118,7 +125,9 @@ export class DecisionModel {
 
   /** dir: a local model directory; by default the files of fountaii/router, downloaded once to a cache
    * (DECISION_MODEL_DIR overrides it, DECISION_CACHE moves the cache). */
-  static async load(dir?: string, { device = "auto", cpuRuntime = "auto", threads }: LoadOptions = {}): Promise<DecisionModel> {
+  static async load(dir?: string, { device = "auto", cpuRuntime = "auto", threads, maxTokens }: LoadOptions = {}): Promise<DecisionModel> {
+    const envMax = process.env["DECISION_MAX_TOKENS"] ? Number(process.env["DECISION_MAX_TOKENS"]) : undefined;
+    const limit = (fallback: number) => maxTokens ?? envMax ?? fallback;
     dir ??= process.env["DECISION_MODEL_DIR"] ?? await ensureModel();
     const config = JSON.parse(fs.readFileSync(path.join(dir, "config.json"), "utf8")) as Config;
     const tokenizer = Tokenizer.fromFile(path.join(dir, "tokenizer.json"));
@@ -133,7 +142,7 @@ export class DecisionModel {
           modelPath: path.join(dir, "model-gpu.onnx"),
           options: { executionProviders: ["cuda"], graphOptimizationLevel: "all" },
         });
-        return new DecisionModel(onnxBackend(session, "onnx-cuda"), tokenizer, config, "cuda");
+        return new DecisionModel(onnxBackend(session, "onnx-cuda"), tokenizer, config, "cuda", Math.min(limit(config.max_context), config.max_context));
       } catch (error) {
         if (wanted === "cuda") throw error;  // auto: a GPU without enough memory or a driver falls back to CPU
       }
@@ -143,9 +152,10 @@ export class DecisionModel {
     const cpu = binding.bitnetCpu();
     if (wantedCpu !== "onnx" && cpu.supported && config.tensors && config.architecture) {
       const native = await binding.BitnetModel.load(path.join(dir, "weights.bin"), config.tensors,
-        { ...config.architecture, max_context: config.max_context, exact_head: process.env["BITNET_EXACT_HEAD"] ? 1 : 0 }, nthreads);
+        { ...config.architecture, max_context: limit(16384), window: config.window ?? config.max_context,
+          exact_head: process.env["BITNET_EXACT_HEAD"] ? 1 : 0 }, nthreads);
       const backend = { runtime: `native-${cpu.kernel}`, run: native.run.bind(native), release: () => native.release() };
-      return new DecisionModel(backend, tokenizer, config, "cpu");
+      return new DecisionModel(backend, tokenizer, config, "cpu", limit(16384));
     }
     if (wantedCpu === "native") throw new Error("The native CPU runtime needs an x86-64 CPU with AVX2 and FMA.");
     const session = await createSession({
@@ -158,7 +168,7 @@ export class DecisionModel {
         executionProviders: ["cpu"],
       },
     });
-    return new DecisionModel(onnxBackend(session, "onnx-cpu"), tokenizer, config, "cpu");
+    return new DecisionModel(onnxBackend(session, "onnx-cpu"), tokenizer, config, "cpu", Math.min(limit(config.max_context), config.max_context));
   }
 
   /** decision_head.encode_case (head-3-branched): prompt ids, option markers in caller order
@@ -188,8 +198,8 @@ export class DecisionModel {
       ids.push(...e.getIds());
       if (index >= first) physical.push(ids.length - 1);
     });
-    if (ids.length > this.config.max_context) {
-      throw new Error(`Prompt needs ${ids.length} tokens and exceeds the context limit (${this.config.max_context})`);
+    if (ids.length > this.maxTokens) {
+      throw new Error(`Prompt needs ${ids.length} tokens and exceeds maxTokens (${this.maxTokens})`);
     }
     const markers = new Array<number>(physical.length);
     [...order, choices.length].forEach((original, index) => { markers[original] = physical[index]!; });
