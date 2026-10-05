@@ -194,9 +194,10 @@ struct Ternary {
   Buf<int8_t> packed;
   Buf<int32_t> colsum128;  // 128 * sum_k B[k][n]: the uint8 activations carry a +128 offset
   Buf<float> scale;        // per packed column: the tensor's 1 / weight_quant scale
+  Buf<float> bias;         // choice-head layers only
 };
 
-enum class Epilogue { Store, Add, SwiGLU };
+enum class Epilogue { Store, Add, SwiGLU, Relu };
 
 template <int R>
 BITNET_VNNI inline void TernaryTileVnni(const uint8_t* a, size_t lda, const int8_t* b, int K, __m256i acc[R][2]) {
@@ -244,6 +245,14 @@ inline void TernaryStore(__m256i acc[R][2], const Ternary& w, int col, const flo
     const __m256 rs = _mm256_set1_ps(rowscale[r]);
     __m256 y0 = _mm256_mul_ps(_mm256_mul_ps(_mm256_cvtepi32_ps(_mm256_sub_epi32(acc[r][0], c0)), s0), rs);
     __m256 y1 = _mm256_mul_ps(_mm256_mul_ps(_mm256_cvtepi32_ps(_mm256_sub_epi32(acc[r][1], c1)), s1), rs);
+    if (w.bias.n) {
+      y0 = _mm256_add_ps(y0, _mm256_loadu_ps(w.bias.get() + col));
+      y1 = _mm256_add_ps(y1, _mm256_loadu_ps(w.bias.get() + col + 8));
+    }
+    if (mode == Epilogue::Relu) {
+      y0 = _mm256_max_ps(y0, _mm256_setzero_ps());
+      y1 = _mm256_max_ps(y1, _mm256_setzero_ps());
+    }
     float* o = out + r * ldo;
     if (mode == Epilogue::SwiGLU) {  // panel = 8 gate columns then the same 8 up columns
       _mm256_storeu_ps(o + col / 2, _mm256_mul_ps(Silu(y0), y1));
@@ -267,26 +276,26 @@ inline void TernaryRows(const uint8_t* a, size_t lda, const Ternary& w, int pane
   TernaryStore<R>(acc, w, panel * NR, rowscale, out, ldo, mode);
 }
 
-// Panels per work item: enough items for every thread (x3 for balance on hybrid cores), at most 4.
-inline int PanelsPerItem(int panels, int threads) { return std::clamp(panels / (3 * threads), 1, 4); }
+// Work item = one 16-column panel x up to kRowBlock tokens (16 register tiles). Small items keep hybrid
+// CPUs balanced: an E-core runs an item ~3x slower than a P-core, so a coarse item taken last by an
+// E-core would stall the whole region. The row block (<= 96 x K bytes of activations) stays in L2 and
+// the panel in L1 while its row tiles stream past.
+constexpr int kRowBlock = 16 * MR;
 
 void TernaryGemm(Pool& pool, const uint8_t* a, const float* rowscale, int M, const Ternary& w,
                  float* out, size_t ldo, Epilogue mode, bool vnni) {
-  // Work item = a few panels over all rows: each weight byte leaves DRAM once per forward, and the
-  // item's panels stay in L2 while the row tiles stream past.
-  const int panels = w.N / NR, per = PanelsPerItem(panels, pool.size());
-  pool.For((panels + per - 1) / per, [&](int item) {
-    const int p0 = item * per, p1 = std::min(panels, p0 + per);
-    int r = 0;
-    for (; r + MR <= M; r += MR)
-      for (int p = p0; p < p1; ++p)
-        TernaryRows<MR>(a + r * static_cast<size_t>(w.K), w.K, w, p, rowscale + r, out + r * ldo, ldo, mode, vnni);
-    for (int p = p0; p < p1; ++p) switch (M - r) {
+  const int panels = w.N / NR, blocks = (M + kRowBlock - 1) / kRowBlock;
+  pool.For(panels * blocks, [&](int item) {
+    const int p = item % panels, r0 = (item / panels) * kRowBlock, r1 = std::min(M, r0 + kRowBlock);
+    int r = r0;
+    for (; r + MR <= r1; r += MR)
+      TernaryRows<MR>(a + r * static_cast<size_t>(w.K), w.K, w, p, rowscale + r, out + r * ldo, ldo, mode, vnni);
+    switch (r1 - r) {
 #define TAIL(n) case n: TernaryRows<n>(a + r * static_cast<size_t>(w.K), w.K, w, p, rowscale + r, out + r * ldo, ldo, mode, vnni); break;
-        TAIL(1) TAIL(2) TAIL(3) TAIL(4) TAIL(5)
+      TAIL(1) TAIL(2) TAIL(3) TAIL(4) TAIL(5)
 #undef TAIL
-        default: break;
-      }
+      default: break;
+    }
   });
 }
 
@@ -322,6 +331,29 @@ void NormQuant(Pool& pool, const float* x, int M, int K, const float* weight, fl
         __m256i w16 = _mm256_permute4x64_epi64(_mm256_packus_epi32(i0, i1), 0xD8);
         __m128i w8 = _mm_packus_epi16(_mm256_castsi256_si128(w16), _mm256_extracti128_si256(w16, 1));
         _mm_storeu_si128(reinterpret_cast<__m128i*>(o + k), w8);
+      }
+      rowscale[t] = absmax / 127.0f;
+    }
+  });
+}
+
+// Per-token absmax int8 quantization (uint8 + 128) of x [M][K] (row stride ldx) into out [M][K].
+void Quant(Pool& pool, const float* x, size_t ldx, int M, int K, uint8_t* out, float* rowscale) {
+  pool.For((M + 3) / 4, [&](int item) {
+    for (int t = item * 4; t < std::min(M, item * 4 + 4); ++t) {
+      const float* xr = x + t * ldx;
+      const __m256 sign = _mm256_set1_ps(-0.0f);
+      __m256 mx = _mm256_setzero_ps();
+      for (int k = 0; k < K; k += 8) mx = _mm256_max_ps(mx, _mm256_andnot_ps(sign, _mm256_loadu_ps(xr + k)));
+      const float absmax = std::max(Hmax(mx), 1e-5f);
+      const __m256 s = _mm256_set1_ps(127.0f / absmax);
+      const __m256i offset = _mm256_set1_epi32(128);
+      uint8_t* o = out + static_cast<size_t>(t) * K;
+      for (int k = 0; k < K; k += 16) {
+        __m256i i0 = _mm256_add_epi32(_mm256_cvtps_epi32(_mm256_round_ps(_mm256_mul_ps(_mm256_loadu_ps(xr + k), s), _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC)), offset);
+        __m256i i1 = _mm256_add_epi32(_mm256_cvtps_epi32(_mm256_round_ps(_mm256_mul_ps(_mm256_loadu_ps(xr + k + 8), s), _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC)), offset);
+        __m256i w16 = _mm256_permute4x64_epi64(_mm256_packus_epi32(i0, i1), 0xD8);
+        _mm_storeu_si128(reinterpret_cast<__m128i*>(o + k), _mm_packus_epi16(_mm256_castsi256_si128(w16), _mm256_extracti128_si256(w16, 1)));
       }
       rowscale[t] = absmax / 127.0f;
     }
@@ -378,18 +410,17 @@ inline void DenseRows(const float* a, size_t lda, const Dense& w, int panel, flo
 // out[M][N] (+)= act(a[M][K] @ W + bias)
 void DenseGemm(Pool& pool, const float* a, size_t lda, int M, const Dense& w, float* out, size_t ldo,
                Act act = Act::None, bool add = false) {
-  const int panels = w.N / NR, per = PanelsPerItem(panels, pool.size());
-  pool.For((panels + per - 1) / per, [&](int item) {
-    const int p0 = item * per, p1 = std::min(panels, p0 + per);
-    int r = 0;
-    for (; r + MR <= M; r += MR)
-      for (int p = p0; p < p1; ++p) DenseRows<MR>(a + r * lda, lda, w, p, out + r * ldo, ldo, act, add);
-    for (int p = p0; p < p1; ++p) switch (M - r) {
+  const int panels = w.N / NR, blocks = (M + kRowBlock - 1) / kRowBlock;
+  pool.For(panels * blocks, [&](int item) {
+    const int p = item % panels, r0 = (item / panels) * kRowBlock, r1 = std::min(M, r0 + kRowBlock);
+    int r = r0;
+    for (; r + MR <= r1; r += MR) DenseRows<MR>(a + r * lda, lda, w, p, out + r * ldo, ldo, act, add);
+    switch (r1 - r) {
 #define TAIL(n) case n: DenseRows<n>(a + r * lda, lda, w, p, out + r * ldo, ldo, act, add); break;
-        TAIL(1) TAIL(2) TAIL(3) TAIL(4) TAIL(5)
+      TAIL(1) TAIL(2) TAIL(3) TAIL(4) TAIL(5)
 #undef TAIL
-        default: break;
-      }
+      default: break;
+    }
   });
 }
 
@@ -419,11 +450,10 @@ void AttentionBlock(const float* q, size_t ldq, const float* keys_t, size_t kstr
   const int total = nk_a + nk_b;
   for (int r = 0; r < R; ++r) {
     float* s = scores + r * lds;
-    // mask keys past the query (causal): key index of score i is i (shared) or b0 + i - nk_a (branch)
-    for (int i = 0; i < total; ++i) {
-      const int key = i < nk_a ? i : b0 + i - nk_a;
-      if (key > last_key[r]) s[i] = kNeg;
-    }
+    // mask keys past the query (causal). Score i is key i (shared range) or key b0 + i - nk_a (the
+    // branch's own range); keys grow with i in each range, so only each range's tail needs masking.
+    for (int i = std::max(0, last_key[r] + 1); i < nk_a; ++i) s[i] = kNeg;
+    if (nk_b) for (int i = nk_a + std::max(0, last_key[r] + 1 - b0); i < total; ++i) s[i] = kNeg;
     for (int i = total; i < (total + 7) / 8 * 8; ++i) s[i] = kNeg;
     __m256 mx = _mm256_set1_ps(kNeg);
     for (int i = 0; i < total; i += 8) mx = _mm256_max_ps(mx, _mm256_loadu_ps(s + i));
@@ -507,9 +537,16 @@ struct Layer {
   Ternary qkv, o, gate_up, down;
 };
 
+// A choice-head linear layer: int8 (7-bit per-channel weights, per-token int8 activations, on the same
+// VNNI kernel as the ternary layers) or exact fp32 (BITNET_EXACT_HEAD=1).
+struct HeadLinear {
+  Dense f32;
+  Ternary i8;
+};
+
 struct HeadLayer {
   Buf<float> norm1_w, norm1_b, norm2_w, norm2_b;
-  Dense kv, q, out, linear1, linear2;
+  HeadLinear kv, q, out, linear1, linear2;
 };
 
 }  // namespace
@@ -521,7 +558,8 @@ class Model {
   std::unique_ptr<Pool> pool;
   Buf<float> embed, rope_cos, rope_sin, final_norm;
   std::vector<Layer> layers;
-  Dense proj, scorer1;
+  bool int8_head = true;
+  HeadLinear proj, scorer1;
   std::vector<HeadLayer> head;
   Buf<float> scorer_norm_w, scorer_norm_b, scorer3_w;
   float scorer3_b = 0;
@@ -638,6 +676,39 @@ void PackDense(const Reader& rd, const std::string& weight, const std::string& b
   rd.Floats(bias, w.bias);
 }
 
+// fp32 [K, N] -> 7-bit per-column weights (|q| <= 63, so the AVX2 maddubs pairs never saturate).
+void PackInt8(const Reader& rd, const std::string& weight, const std::string& bias, Ternary& w) {
+  const auto shape = rd.Shape(weight);
+  w.K = static_cast<int>(shape[0]);
+  w.N = static_cast<int>(shape[1]);
+  if (w.K % 4 || w.N % NR) throw std::runtime_error("weights: unsupported shape for " + weight);
+  const auto b = rd.FloatValues(weight);
+  w.packed.resize(static_cast<size_t>(w.K) * w.N);
+  w.colsum128.resize(w.N);
+  w.scale.resize(w.N);
+  for (int c = 0; c < w.N; ++c) {
+    float absmax = 0;
+    for (int k = 0; k < w.K; ++k) absmax = std::max(absmax, std::fabs(b[static_cast<size_t>(k) * w.N + c]));
+    const float step = absmax > 0 ? absmax / 63.0f : 1.0f;
+    int8_t* panel = w.packed.get() + static_cast<size_t>(c / NR) * w.K * NR;
+    int sum = 0;
+    for (int k = 0; k < w.K; ++k) {
+      const int q = static_cast<int>(std::nearbyint(b[static_cast<size_t>(k) * w.N + c] / step));
+      const int8_t v = static_cast<int8_t>(std::clamp(q, -63, 63));
+      panel[(k / 4) * 4 * NR + (c % NR) * 4 + (k % 4)] = v;
+      sum += v;
+    }
+    w.colsum128[c] = 128 * sum;
+    w.scale[c] = step;
+  }
+  rd.Floats(bias, w.bias);
+}
+
+void PackHead(const Reader& rd, const std::string& weight, const std::string& bias, HeadLinear& w, bool int8) {
+  if (int8) PackInt8(rd, weight, bias, w.i8);
+  else PackDense(rd, weight, bias, w.f32);
+}
+
 void LayerNorm(Pool& pool, const float* x, size_t ldx, int M, int K, const float* w, const float* b, float* out, size_t ldo) {
   pool.For((M + 7) / 8, [&](int item) {
     for (int t = item * 8; t < std::min(M, item * 8 + 8); ++t) {
@@ -690,7 +761,9 @@ Model* Load(const std::string& path, const std::map<std::string, Source>& tensor
     PackTernary(rd, p + "gate_up", l.gate_up, true);
     PackTernary(rd, p + "down", l.down, false);
   }
-  PackDense(rd, "choice_head.proj.weight.T", "choice_head.proj.bias", model->proj);
+  model->int8_head = !cfg.exact_head;
+  const bool i8 = model->int8_head;
+  PackHead(rd, "choice_head.proj.weight.T", "choice_head.proj.bias", model->proj, i8);
   model->head.resize(cfg.head_layers);
   for (int i = 0; i < cfg.head_layers; ++i) {
     const std::string p = "choice_head.encoder.layers." + std::to_string(i) + ".";
@@ -699,15 +772,15 @@ Model* Load(const std::string& path, const std::map<std::string, Source>& tensor
     rd.Floats(p + "norm1.bias", l.norm1_b);
     rd.Floats(p + "norm2.weight", l.norm2_w);
     rd.Floats(p + "norm2.bias", l.norm2_b);
-    PackDense(rd, p + "kv.T", p + "kv.b", l.kv);
-    PackDense(rd, p + "q.T", p + "q.b", l.q);
-    PackDense(rd, p + "self_attn.out_proj.weight.T", p + "self_attn.out_proj.bias", l.out);
-    PackDense(rd, p + "linear1.weight.T", p + "linear1.bias", l.linear1);
-    PackDense(rd, p + "linear2.weight.T", p + "linear2.bias", l.linear2);
+    PackHead(rd, p + "kv.T", p + "kv.b", l.kv, i8);
+    PackHead(rd, p + "q.T", p + "q.b", l.q, i8);
+    PackHead(rd, p + "self_attn.out_proj.weight.T", p + "self_attn.out_proj.bias", l.out, i8);
+    PackHead(rd, p + "linear1.weight.T", p + "linear1.bias", l.linear1, i8);
+    PackHead(rd, p + "linear2.weight.T", p + "linear2.bias", l.linear2, i8);
   }
   rd.Floats("choice_head.scorer.0.weight", model->scorer_norm_w);
   rd.Floats("choice_head.scorer.0.bias", model->scorer_norm_b);
-  PackDense(rd, "choice_head.scorer.1.weight.T", "choice_head.scorer.1.bias", model->scorer1);
+  PackHead(rd, "choice_head.scorer.1.weight.T", "choice_head.scorer.1.bias", model->scorer1, i8);
   rd.Floats("choice_head.scorer.3.weight.T", model->scorer3_w);
   model->scorer3_b = rd.FloatValues("choice_head.scorer.3.bias").at(0);
   return model.release();
@@ -743,6 +816,19 @@ void Attend(Model& m, const float* qkv, size_t ldq, int qcol, int kcol, int vcol
       default: break;
     }
   });
+}
+
+}  // namespace
+
+namespace {
+
+// out[M][N] (+)= act(a[M][K] @ W + bias) with the head layer's int8 or fp32 weights.
+void HeadGemm(Model& m, const float* a, size_t lda, int M, const HeadLinear& w, float* out, size_t ldo,
+              Act act = Act::None, bool add = false) {
+  if (!m.int8_head) return DenseGemm(*m.pool, a, lda, M, w.f32, out, ldo, act, add);
+  Quant(*m.pool, a, lda, M, w.i8.K, m.act.get(), m.rowscale.get());
+  TernaryGemm(*m.pool, m.act.get(), m.rowscale.get(), M, w.i8, out, ldo,
+              add ? Epilogue::Add : act == Act::Relu ? Epilogue::Relu : Epilogue::Store, m.vnni);
 }
 
 }  // namespace
@@ -868,7 +954,7 @@ std::vector<float> Forward(Model& m, const int32_t* ids, const int32_t* position
   m.ff.resize(static_cast<size_t>(n) * 4 * W);
   m.zq.resize(static_cast<size_t>(std::max(count, 1)) * W);
   m.xq.resize(static_cast<size_t>(std::max(count, 1)) * W);
-  DenseGemm(pool, h, H, n, m.proj, m.z.get(), W);
+  HeadGemm(m, h, H, n, m.proj, m.z.get(), W);
   profile.Mark(6);
   std::vector<QueryBlock> all_blocks, marker_blocks;
   for (int s = 0; s < n; s += MR) all_blocks.push_back({s, std::min(MR, n - s), n, 0, 0});
@@ -882,7 +968,7 @@ std::vector<float> Forward(Model& m, const int32_t* ids, const int32_t* position
     const bool last = li == c.head_layers - 1;
     LayerNorm(pool, z, W, n, W, L.norm1_w.get(), L.norm1_b.get(), m.x.get(), W);
     profile.Mark(8);
-    DenseGemm(pool, m.x.get(), W, n, L.kv, m.kv.get(), 2 * W);
+    HeadGemm(m, m.x.get(), W, n, L.kv, m.kv.get(), 2 * W);
     float* zr = z;
     const float* xr = m.x.get();
     if (last) {  // only the option rows reach the scorer
@@ -894,7 +980,7 @@ std::vector<float> Forward(Model& m, const int32_t* ids, const int32_t* position
       xr = m.xq.get();
       rows_now = count;
     }
-    DenseGemm(pool, xr, W, rows_now, L.q, m.qh.get(), W);
+    HeadGemm(m, xr, W, rows_now, L.q, m.qh.get(), W);
     profile.Mark(6);
     // attention: queries in qh (stride W), keys/values in kv (stride 2W); output into ff (stride W)
     {
@@ -922,18 +1008,18 @@ std::vector<float> Forward(Model& m, const int32_t* ids, const int32_t* position
       });
     }
     profile.Mark(7);
-    DenseGemm(pool, m.ff.get(), W, rows_now, L.out, zr, W, Act::None, true);
+    HeadGemm(m, m.ff.get(), W, rows_now, L.out, zr, W, Act::None, true);
     profile.Mark(6);
     LayerNorm(pool, zr, W, rows_now, W, L.norm2_w.get(), L.norm2_b.get(), m.x.get(), W);
     profile.Mark(8);
-    DenseGemm(pool, m.x.get(), W, rows_now, L.linear1, m.ff.get(), 4 * W, Act::Relu);
-    DenseGemm(pool, m.ff.get(), 4 * W, rows_now, L.linear2, zr, W, Act::None, true);
+    HeadGemm(m, m.x.get(), W, rows_now, L.linear1, m.ff.get(), 4 * W, Act::Relu);
+    HeadGemm(m, m.ff.get(), 4 * W, rows_now, L.linear2, zr, W, Act::None, true);
     profile.Mark(6);
     z = zr;
   }
   // scorer: LayerNorm -> Linear -> GELU (erf) -> Linear(1)
   LayerNorm(pool, z, W, count, W, m.scorer_norm_w.get(), m.scorer_norm_b.get(), m.x.get(), W);
-  DenseGemm(pool, m.x.get(), W, count, m.scorer1, m.ff.get(), W);
+  HeadGemm(m, m.x.get(), W, count, m.scorer1, m.ff.get(), W);
   std::vector<float> logits(count);
   for (int i = 0; i < count; ++i) {
     const float* s = m.ff.get() + static_cast<size_t>(i) * W;

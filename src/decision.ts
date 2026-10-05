@@ -142,7 +142,7 @@ export class DecisionModel {
     const cpu = binding.bitnetCpu();
     if (wantedCpu !== "onnx" && cpu.supported && config.tensors && config.architecture) {
       const native = await binding.BitnetModel.load(path.join(dir, "weights.bin"), config.tensors,
-        { ...config.architecture, max_context: config.max_context }, nthreads);
+        { ...config.architecture, max_context: config.max_context, exact_head: process.env["BITNET_EXACT_HEAD"] ? 1 : 0 }, nthreads);
       const backend = { runtime: `native-${cpu.kernel}`, run: native.run.bind(native), release: () => native.release() };
       return new DecisionModel(backend, tokenizer, config, "cpu");
     }

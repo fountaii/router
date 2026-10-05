@@ -128,6 +128,7 @@ class BitnetModel : public Napi::ObjectWrap<BitnetModel> {
     config.vocab = num("vocab").Int32Value();
     config.max_context = num("max_context").Int32Value();
     config.rms_eps = num("rms_eps").FloatValue();
+    config.exact_head = c.Has("exact_head") && c.Get("exact_head").ToBoolean();
     const int threads = info[3].As<Napi::Number>().Int32Value();
     auto* worker = new LoadWorker(env, info[0].As<Napi::String>(), std::move(tensors), config, threads);
     worker->Queue();
